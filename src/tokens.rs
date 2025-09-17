@@ -16,6 +16,7 @@ pub enum TokenType {
     LeftParen,
     RightParen,
     Colon,
+    DoubleColon,
     Equal,
     Arrow,
     Caret,
@@ -30,7 +31,9 @@ pub enum TokenType {
     // --- 字面量 ---
     Identifier,
     Integer,
+    Float,
     String,
+    Bool,
 
     // --- 关键字 ---
     Let,
