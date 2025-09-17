@@ -1,6 +1,8 @@
 mod tokens;
+#[cfg(test)]
+mod tests;
 
-use nyanc_core::errors::{CompilerError, LexerError};
+use nyanc_core::errors::{CompilerError, LexerError, LexerErrorKind};
 use nyanc_core::{FileId, Span};
 use reporter::DiagnosticsEngine;
 use tokens::{Token, TokenType};
@@ -8,13 +10,9 @@ use tokens::{Token, TokenType};
 use std::iter::Peekable;
 use std::str::Chars;
 
-// 暂时还没用到 CompilationContext，但先把架子搭好
-// use nyanc::CompilationContext;
-
 /// Lexer 负责将源代码字符串分解为 Token 序列。
 pub struct Lexer<'a> {
     diagnostics: &'a DiagnosticsEngine,
-    // context: &'a CompilationContext, // 暂时注释掉，直到我们开始处理错误
     source: &'a str,            // 完整的源代码引用，用于从 Span 中提取 lexeme
     chars: Peekable<Chars<'a>>, // 带有预读能力的字符迭代器
 
@@ -36,7 +34,6 @@ impl<'a> Lexer<'a> {
     pub fn new(source: &'a str, file_id: FileId, diagnostics: &'a DiagnosticsEngine) -> Self {
         Self {
             diagnostics,
-            // context,
             source,
             chars: source.chars().peekable(),
             file_id,
@@ -97,7 +94,6 @@ impl<'a> Lexer<'a> {
                 '}' => self.make_token(TokenType::RightBrace),
                 '(' => self.make_token(TokenType::LeftParen),
                 ')' => self.make_token(TokenType::RightParen),
-                ':' => self.make_token(TokenType::Colon),
                 '=' => self.make_token(TokenType::Equal),
                 '^' => self.make_token(TokenType::Caret),
                 '&' => self.make_token(TokenType::Ampersand),
@@ -106,7 +102,7 @@ impl<'a> Lexer<'a> {
                 '+' => self.make_token(TokenType::Plus),
                 '*' => self.make_token(TokenType::Star),
                 '/' => self.make_token(TokenType::Slash),
-
+                
                 // --- 可能的多字符 Token ---
                 '-' => {
                     if self.peek() == Some('>') {
@@ -117,6 +113,15 @@ impl<'a> Lexer<'a> {
                     }
                 }
 
+                ':' => {
+                    if self.peek() == Some(':') {
+                        self.advance(); // 消耗第二个 ':'
+                        self.make_token(TokenType::DoubleColon)
+                    } else {
+                        self.make_token(TokenType::Colon)
+                    }
+                },
+                
                 // --- 换行符 ---
                 '\n' => {
                     let token = self.make_token(TokenType::Newline);
@@ -130,6 +135,14 @@ impl<'a> Lexer<'a> {
                 c if c.is_ascii_digit() => self.scan_number(),
                 c if c.is_alphabetic() || c == '_' => self.scan_identifier(),
 
+                // 单独捕获分号
+                ';' => {
+                    // 当我们捕获到分号时...
+                    let err_span = Span { file_id: self.file_id, start: self.start_pos, end: self.current_pos };
+                    let err = LexerError::new(LexerErrorKind::UnnecessarySemicolon, err_span);
+                    self.diagnostics.add_error(CompilerError::Lexer(err));
+                    self.make_token(TokenType::Illegal)
+                }
                 // --- 未知字符 ---
                 _ => self.make_token(TokenType::Illegal),
             }
@@ -159,8 +172,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 扫描一个完整的数字字面量
+    /// 扫描一个完整的数字字面量，可以是整数或浮点数
     fn scan_number(&mut self) -> Token {
+        // 1. 扫描整数部分
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 self.advance();
@@ -168,29 +182,98 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        self.make_token(TokenType::Integer)
-    }
 
-    /// 扫描一个完整的字符串字面量
-    fn scan_string(&mut self) -> Token {
-        // 简单实现：扫描直到下一个 "
-        // 注意：这个实现没有处理转义字符 `\"` 或字符串跨行的情况
-        while let Some(c) = self.peek() {
-            if c != '"' {
-                self.advance();
-            } else {
-                break;
+        // 2. 检查是否是浮点数
+        // 我们需要预读两位：一个 '.' 和它后面的一个数字
+        let mut is_float = false;
+        if self.peek() == Some('.') {
+            // 创建一个临时的克隆迭代器来预读两位
+            let mut ahead = self.chars.clone();
+            ahead.next(); // 跳过 '.'
+            if let Some(next_c) = ahead.next() {
+                if next_c.is_ascii_digit() {
+                    is_float = true;
+                    self.advance(); // 确认是浮点数，消耗 '.'
+
+                    // 3. 扫描小数部分
+                    while let Some(c) = self.peek() {
+                        if c.is_ascii_digit() {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
         }
-
-        // 如果没有闭合的引号，这是一个错误，但我们暂时简化处理
-        if self.peek() == Some('"') {
-            self.advance(); // 消耗末尾的 "
+        
+        if is_float {
+            self.make_token(TokenType::Float)
         } else {
-            // TODO: 报告一个未闭合的字符串错误
+            self.make_token(TokenType::Integer)
         }
+    }
 
-        self.make_token(TokenType::String)
+    /// 扫描一个完整的字符串字面量，支持多行和转义字符。
+    fn scan_string(&mut self) -> Token {
+        // 不断循环，直到找到闭合的引号或文件末尾
+        loop {
+            match self.peek() {
+                // --- 找到闭合引号：成功路径 ---
+                Some('"') => {
+                    self.advance(); // 消耗闭合的 "
+                    return self.make_token(TokenType::String);
+                }
+                // --- 文件结尾：错误路径 ---
+                None => {
+                    // 我们到达了文件末尾，但字符串没有闭合
+                    // 错误应该从字符串的起始位置（self.start_pos）到当前位置
+                    let err_span = Span { file_id: self.file_id, start: self.start_pos, end: self.current_pos };
+                    let err = LexerError::new(LexerErrorKind::UnterminatedString, err_span);
+                    self.diagnostics.add_error(CompilerError::Lexer(err));
+
+                    // 返回一个 Illegal Token，让编译器知道这里出了问题
+                    return self.make_token(TokenType::Illegal);
+                }
+                // --- 换行符：支持多行字符串 ---
+                Some('\n') => {
+                    self.advance();
+                    self.line += 1;
+                    self.column = 1;
+                }
+                // --- 转义字符处理 ---
+                Some('\\') => {
+                    self.advance(); // 消耗 '\'
+                    
+                    // 查看转义的字符是什么
+                    match self.peek() {
+                        Some('"' | '\\' | 'n' | 'r' | 't') => {
+                            // 合法的转义，直接消耗掉后面的字符
+                            self.advance();
+                        }
+                        Some(c) => {
+                            // 无效的转义
+                            let err_start = self.current_pos - 1; // 错误位置从 '\' 开始
+                            self.advance(); // 消耗这个无效字符
+                            let err_span = Span { file_id: self.file_id, start: err_start, end: self.current_pos };
+                            let err = LexerError::new(LexerErrorKind::InvalidEscapeSequence(c), err_span);
+                            self.diagnostics.add_error(CompilerError::Lexer(err));
+                        }
+                        None => {
+                            // '\' 后面直接是文件结尾，也属于未闭合
+                            let err_span = Span { file_id: self.file_id, start: self.start_pos, end: self.current_pos };
+                            let err = LexerError::new(LexerErrorKind::UnterminatedString, err_span);
+                            self.diagnostics.add_error(CompilerError::Lexer(err));
+                            return self.make_token(TokenType::Illegal);
+                        }
+                    }
+                }
+                // --- 其他普通字符 ---
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     /// 扫描一个完整的标识符，并检查它是否是关键字
@@ -205,6 +288,7 @@ impl<'a> Lexer<'a> {
 
         let lexeme = &self.source[self.start_pos..self.current_pos];
         let kind = match lexeme {
+            "true" | "false" => TokenType::Bool,
             "fun" => TokenType::Fun,
             "let" => TokenType::Let,
             "if" => TokenType::If,
