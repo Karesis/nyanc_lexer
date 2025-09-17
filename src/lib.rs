@@ -1,11 +1,10 @@
-mod tokens;
 #[cfg(test)]
 mod tests;
 
 use nyanc_core::errors::{CompilerError, LexerError, LexerErrorKind};
 use nyanc_core::{FileId, Span};
+use nyanc_core::tokens::{Token, TokenType};
 use reporter::DiagnosticsEngine;
-use tokens::{Token, TokenType};
 // 引入标准库的 Peekable 迭代器，这是我们实现预读功能的核心
 use std::iter::Peekable;
 use std::str::Chars;
@@ -94,7 +93,6 @@ impl<'a> Lexer<'a> {
                 '}' => self.make_token(TokenType::RightBrace),
                 '(' => self.make_token(TokenType::LeftParen),
                 ')' => self.make_token(TokenType::RightParen),
-                '=' => self.make_token(TokenType::Equal),
                 '^' => self.make_token(TokenType::Caret),
                 '&' => self.make_token(TokenType::Ampersand),
                 '.' => self.make_token(TokenType::Dot),
@@ -119,6 +117,40 @@ impl<'a> Lexer<'a> {
                         self.make_token(TokenType::DoubleColon)
                     } else {
                         self.make_token(TokenType::Colon)
+                    }
+                },
+
+                '=' => { // 等于号现在可能是 = 或 ==
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        self.make_token(TokenType::EqualEqual)
+                    } else {
+                        self.make_token(TokenType::Equal)
+                    }
+                },
+                '!' => { // 增加对 != 的支持
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        self.make_token(TokenType::BangEqual)
+                    } else {
+                        // 如果未来有 '!' (not) 操作符，在这里处理
+                        self.make_token(TokenType::Illegal)
+                    }
+                },
+                '>' => { // 增加 > 和 >=
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        self.make_token(TokenType::GreaterEqual)
+                    } else {
+                        self.make_token(TokenType::Greater)
+                    }
+                },
+                '<' => { // 增加 < 和 <=
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        self.make_token(TokenType::LessEqual)
+                    } else {
+                        self.make_token(TokenType::Less)
                     }
                 },
                 
@@ -298,6 +330,8 @@ impl<'a> Lexer<'a> {
             "return" => TokenType::Return,
             "pub" => TokenType::Pub,
             "use" => TokenType::Use,
+            "as" => TokenType::As,
+            "self" => TokenType::SSelf,
             _ => TokenType::Identifier,
         };
         self.make_token(kind)
